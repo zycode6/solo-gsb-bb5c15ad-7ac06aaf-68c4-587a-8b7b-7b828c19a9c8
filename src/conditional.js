@@ -28,29 +28,114 @@ const MONTH_INDEX = {
   Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
 };
 
-// IMF-fixdate, the sole HTTP-date shape senders generate (RFC 9110 §5.6.7):
-//   Sun-day-name "," SP 2DIGIT SP month SP 4DIGIT SP time SP "GMT"
-const IMF_FIXDATE_RE =
-  /^(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+// HTTP-date (RFC 9110 §5.6.7) = IMF-fixdate / obs-date. Recipients MUST accept
+// all three standard formats, even though senders only generate IMF-fixdate:
+//
+//   IMF-fixdate: Sun, 06 Nov 1994 08:49:37 GMT
+//   RFC 850:     Sunday, 06-Nov-94 08:49:37 GMT
+//   asctime:     Sun Nov  6 08:49:37 1994
+const SHORT_WEEKDAY = '(Sun|Mon|Tue|Wed|Thu|Fri|Sat)';
+const LONG_WEEKDAY = '(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)';
+const MONTH_NAME = '(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)';
+const TIME_OF_DAY = '(\\d{2}):(\\d{2}):(\\d{2})';
+
+const IMF_FIXDATE_RE = new RegExp(
+  `^${SHORT_WEEKDAY}, (\\d{2}) ${MONTH_NAME} (\\d{4}) ${TIME_OF_DAY} GMT$`,
+);
+const RFC850_DATE_RE = new RegExp(
+  `^${LONG_WEEKDAY}, (\\d{2})-${MONTH_NAME}-(\\d{2}) ${TIME_OF_DAY} GMT$`,
+);
+// date3 = month SP ( 2DIGIT / SP 1DIGIT ): a single-digit day is padded with a
+// second space ("Nov  6"), never with a zero and never left bare.
+const ASCTIME_DATE_RE = new RegExp(
+  `^${SHORT_WEEKDAY} ${MONTH_NAME} (\\d{2}| \\d) ${TIME_OF_DAY} (\\d{4})$`,
+);
 
 /**
- * Parse a strict IMF-fixdate into a millisecond timestamp.
+ * Match any of the three HTTP-date formats, returning the calendar fields
+ * (weekday normalised to its three-letter abbreviation) or null.
+ */
+function matchHttpDate(value) {
+  if (typeof value !== 'string') return null;
+
+  let m = IMF_FIXDATE_RE.exec(value);
+  if (m) {
+    return {
+      weekday: m[1],
+      day: Number(m[2]),
+      month: MONTH_INDEX[m[3]],
+      year: Number(m[4]),
+      hour: Number(m[5]),
+      minute: Number(m[6]),
+      second: Number(m[7]),
+      twoDigitYear: false,
+    };
+  }
+
+  m = RFC850_DATE_RE.exec(value);
+  if (m) {
+    return {
+      weekday: m[1].slice(0, 3),
+      day: Number(m[2]),
+      month: MONTH_INDEX[m[3]],
+      year: Number(m[4]),
+      hour: Number(m[5]),
+      minute: Number(m[6]),
+      second: Number(m[7]),
+      twoDigitYear: true,
+    };
+  }
+
+  m = ASCTIME_DATE_RE.exec(value);
+  if (m) {
+    return {
+      weekday: m[1],
+      day: Number(m[3]),
+      month: MONTH_INDEX[m[2]],
+      year: Number(m[7]),
+      hour: Number(m[4]),
+      minute: Number(m[5]),
+      second: Number(m[6]),
+      twoDigitYear: false,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * RFC 9110 §5.6.7: a recipient parsing an rfc850-date two-digit year MUST
+ * interpret a timestamp that appears to be more than 50 years in the future
+ * as the most recent year in the past that had the same last two digits.
+ * The year is resolved against the receiver's current UTC year.
+ */
+function resolveRfc850Year(twoDigitYear, currentYear) {
+  let year = Math.floor(currentYear / 100) * 100 + twoDigitYear;
+  if (year - currentYear > 50) year -= 100;
+  return year;
+}
+
+/**
+ * Parse a strict HTTP-date (RFC 9110 §5.6.7) into a millisecond timestamp.
+ * All three standard formats are accepted: IMF-fixdate, RFC 850 and asctime.
  *
  * Returns null for anything that is not a syntactically and semantically
- * valid HTTP-date: the shape is matched with a strict regex, then the value
- * is reconstructed via Date.UTC to reject impossible dates (e.g. Feb 30) and
- * weekdays that do not match the calendar date.
+ * valid HTTP-date: the shape is matched with strict regexes, then the value
+ * is reconstructed via Date.UTC to reject impossible dates (e.g. Feb 30),
+ * weekdays that do not match the calendar date and out-of-range time fields.
+ *
+ * @param {string} value
+ * @param {Date} [now] reception time; only used to resolve RFC 850 two-digit
+ *   years (defaults to the current time)
  */
-export function parseHttpDate(value) {
-  if (typeof value !== 'string' || !IMF_FIXDATE_RE.test(value)) return null;
+export function parseHttpDate(value, now = new Date()) {
+  const fields = matchHttpDate(value);
+  if (fields === null) return null;
 
-  const weekday = value.slice(0, 3);
-  const day = Number(value.slice(5, 7));
-  const month = MONTH_INDEX[value.slice(8, 11)];
-  const year = Number(value.slice(12, 16));
-  const hour = Number(value.slice(17, 19));
-  const minute = Number(value.slice(20, 22));
-  const second = Number(value.slice(23, 25));
+  const { weekday, day, month, hour, minute, second } = fields;
+  const year = fields.twoDigitYear
+    ? resolveRfc850Year(fields.year, now.getUTCFullYear())
+    : fields.year;
 
   if (hour > 23 || minute > 59 || second > 59) return null;
 
@@ -74,13 +159,14 @@ export function parseHttpDate(value) {
  *
  * @param {string} ifRange      received If-Range field value
  * @param {string} [etag]       current ETag of the resource (strong or weak)
- * @param {string} [lastModified] current Last-Modified as an IMF-fixdate
+ * @param {string} [lastModified] current Last-Modified as an HTTP-date
+ * @param {Date} [now]          reception time for RFC 850 year resolution
  * @returns {{satisfied: boolean, kind: 'etag'|'date', reason: string}}
  *   reason is one of etag-match / etag-mismatch / weak-validator /
  *   date-not-earlier / date-earlier / resource-metadata-missing /
  *   invalid-validator.
  */
-export function evaluateIfRange({ ifRange, etag, lastModified } = {}) {
+export function evaluateIfRange({ ifRange, etag, lastModified, now } = {}) {
   const value = ifRange;
   if (typeof value !== 'string' || value.length === 0) {
     return { satisfied: false, kind: 'etag', reason: 'invalid-validator' };
@@ -109,11 +195,11 @@ export function evaluateIfRange({ ifRange, etag, lastModified } = {}) {
     return { satisfied: false, kind: 'etag', reason: 'weak-validator' };
   }
 
-  const requestTime = parseHttpDate(value);
+  const requestTime = parseHttpDate(value, now);
   if (requestTime === null) {
     return { satisfied: false, kind: 'date', reason: 'invalid-validator' };
   }
-  const currentTime = typeof lastModified === 'string' ? parseHttpDate(lastModified) : null;
+  const currentTime = typeof lastModified === 'string' ? parseHttpDate(lastModified, now) : null;
   if (currentTime === null) {
     return { satisfied: false, kind: 'date', reason: 'resource-metadata-missing' };
   }

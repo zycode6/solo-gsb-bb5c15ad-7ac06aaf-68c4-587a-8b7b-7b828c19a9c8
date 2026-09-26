@@ -173,7 +173,9 @@ function checkMetadata({ etag, lastModified }) {
         statusCode: 400,
         code: 'INVALID_LAST_MODIFIED',
         error: 'Bad Request',
-        message: 'lastModified must be a valid IMF-fixdate, e.g. Tue, 15 Nov 1994 08:12:31 GMT',
+        message:
+          'lastModified must be a valid HTTP-date (IMF-fixdate, RFC 850 or asctime), ' +
+          'e.g. Tue, 15 Nov 1994 08:12:31 GMT',
       };
     }
   }
