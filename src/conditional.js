@@ -28,36 +28,100 @@ const MONTH_INDEX = {
   Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11,
 };
 
-// IMF-fixdate, the sole HTTP-date shape senders generate (RFC 9110 §5.6.7):
-//   Sun-day-name "," SP 2DIGIT SP month SP 4DIGIT SP time SP "GMT"
+// A recipient MUST accept all three HTTP-date formats (RFC 9110 §5.6.7):
+//
+//   IMF-fixdate (the only shape senders generate):
+//     Sun, 06 Nov 1994 08:49:37 GMT
 const IMF_FIXDATE_RE =
-  /^(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+  /^(?<weekday>Sun|Mon|Tue|Wed|Thu|Fri|Sat), (?<day>\d{2}) (?<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?<year>\d{4}) (?<hour>\d{2}):(?<minute>\d{2}):(?<second>\d{2}) GMT$/;
+//
+//   obs-date — RFC 850 (full weekday name, 2-digit year):
+//     Sunday, 06-Nov-94 08:49:37 GMT
+const RFC850_DATE_RE =
+  /^(?<weekday>Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday), (?<day>\d{2})-(?<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-(?<year>\d{2}) (?<hour>\d{2}):(?<minute>\d{2}):(?<second>\d{2}) GMT$/;
+//
+//   obs-date — ANSI C asctime (single-digit days are SP-padded):
+//     Sun Nov  6 08:49:37 1994
+const ASCTIME_DATE_RE =
+  /^(?<weekday>Sun|Mon|Tue|Wed|Thu|Fri|Sat) (?<month>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (?<day>\d{2}| \d) (?<hour>\d{2}):(?<minute>\d{2}):(?<second>\d{2}) (?<year>\d{4})$/;
 
 /**
- * Parse a strict IMF-fixdate into a millisecond timestamp.
+ * Parse a strict HTTP-date into a millisecond timestamp.
  *
+ * Accepts all three standard formats (IMF-fixdate, RFC 850, asctime).
  * Returns null for anything that is not a syntactically and semantically
  * valid HTTP-date: the shape is matched with a strict regex, then the value
- * is reconstructed via Date.UTC to reject impossible dates (e.g. Feb 30) and
+ * is reconstructed via Date.UTC to reject impossible dates (e.g. Feb 30),
+ * out-of-range time fields and weekdays that do not match the calendar date.
+ *
+ * @param {string} value the received date string
+ * @param {Date} [now] reception time, used to resolve RFC 850 two-digit
+ *   years; defaults to the current instant.
+ */
+export function parseHttpDate(value, now = new Date()) {
+  if (typeof value !== 'string') return null;
+
+  const imf = IMF_FIXDATE_RE.exec(value);
+  if (imf) {
+    return buildInstant(toParts(imf.groups, imf.groups.weekday, Number(imf.groups.year)));
+  }
+
+  const rfc850 = RFC850_DATE_RE.exec(value);
+  if (rfc850) {
+    return buildInstant(
+      toParts(
+        rfc850.groups,
+        // Full weekday name -> the 3-letter form used for the round-trip check.
+        rfc850.groups.weekday.slice(0, 3),
+        resolveRfc850Year(Number(rfc850.groups.year), now),
+      ),
+    );
+  }
+
+  const asctime = ASCTIME_DATE_RE.exec(value);
+  if (asctime) {
+    // Number() absorbs the SP padding of a single-digit day (" 6" -> 6).
+    return buildInstant(toParts(asctime.groups, asctime.groups.weekday, Number(asctime.groups.year)));
+  }
+
+  return null;
+}
+
+function toParts(groups, weekday, year) {
+  return {
+    weekday,
+    day: Number(groups.day),
+    month: MONTH_INDEX[groups.month],
+    year,
+    hour: Number(groups.hour),
+    minute: Number(groups.minute),
+    second: Number(groups.second),
+  };
+}
+
+/**
+ * RFC 9110 §5.6.7: a two-digit year is interpreted relative to the UTC year
+ * in which the message is received; if the result would be more than 50
+ * years in the future, it is moved back one century. Received in 2026,
+ * "94" therefore means 1994 while "26" means 2026.
+ */
+function resolveRfc850Year(twoDigitYear, now) {
+  const currentYear = now.getUTCFullYear();
+  const year = Math.floor(currentYear / 100) * 100 + twoDigitYear;
+  return year - currentYear > 50 ? year - 100 : year;
+}
+
+/**
+ * Reconstruct the instant from the parsed fields and round-trip it: rejects
+ * impossible calendar dates (e.g. "31 Feb"), out-of-range time fields and
  * weekdays that do not match the calendar date.
  */
-export function parseHttpDate(value) {
-  if (typeof value !== 'string' || !IMF_FIXDATE_RE.test(value)) return null;
-
-  const weekday = value.slice(0, 3);
-  const day = Number(value.slice(5, 7));
-  const month = MONTH_INDEX[value.slice(8, 11)];
-  const year = Number(value.slice(12, 16));
-  const hour = Number(value.slice(17, 19));
-  const minute = Number(value.slice(20, 22));
-  const second = Number(value.slice(23, 25));
-
+function buildInstant({ weekday, day, month, year, hour, minute, second }) {
   if (hour > 23 || minute > 59 || second > 59) return null;
 
   const time = Date.UTC(year, month, day, hour, minute, second);
   const date = new Date(time);
 
-  // Round-trip rejects e.g. "Mon, 31 Feb 2024 ..." and wrong weekdays.
   if (
     date.getUTCFullYear() !== year ||
     date.getUTCMonth() !== month ||
@@ -74,7 +138,7 @@ export function parseHttpDate(value) {
  *
  * @param {string} ifRange      received If-Range field value
  * @param {string} [etag]       current ETag of the resource (strong or weak)
- * @param {string} [lastModified] current Last-Modified as an IMF-fixdate
+ * @param {string} [lastModified] current Last-Modified as an HTTP-date
  * @returns {{satisfied: boolean, kind: 'etag'|'date', reason: string}}
  *   reason is one of etag-match / etag-mismatch / weak-validator /
  *   date-not-earlier / date-earlier / resource-metadata-missing /
@@ -109,11 +173,14 @@ export function evaluateIfRange({ ifRange, etag, lastModified } = {}) {
     return { satisfied: false, kind: 'etag', reason: 'weak-validator' };
   }
 
-  const requestTime = parseHttpDate(value);
+  // Both dates are interpreted relative to one reception instant so the
+  // parsed-millisecond comparison stays consistent across year boundaries.
+  const now = new Date();
+  const requestTime = parseHttpDate(value, now);
   if (requestTime === null) {
     return { satisfied: false, kind: 'date', reason: 'invalid-validator' };
   }
-  const currentTime = typeof lastModified === 'string' ? parseHttpDate(lastModified) : null;
+  const currentTime = typeof lastModified === 'string' ? parseHttpDate(lastModified, now) : null;
   if (currentTime === null) {
     return { satisfied: false, kind: 'date', reason: 'resource-metadata-missing' };
   }

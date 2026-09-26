@@ -42,7 +42,7 @@ curl http://localhost:3000/healthz
 | `size`           | integer | 是   | 资源总字节数，非负安全整数（≥ 0）       |
 | `contentType`    | string  | 否   | 资源媒体类型，默认 `application/octet-stream` |
 | `etag`           | string  | 否   | 资源当前的实体标签（entity-tag），如 `"v1-abc"` 或 `W/"v1-abc"` |
-| `lastModified`   | string  | 否   | 资源当前的 `Last-Modified`，必须是合法 IMF-fixdate，如 `Wed, 21 Oct 2015 07:28:00 GMT` |
+| `lastModified`   | string  | 否   | 资源当前的 `Last-Modified`，必须是合法 HTTP-date（IMF-fixdate / RFC 850 / asctime 三种标准格式之一），如 `Wed, 21 Oct 2015 07:28:00 GMT` |
 
 可另带可选的 `If-Range` 请求头（单个**强 ETag** 或单个 **HTTP-date**），按
 [RFC 9110 §13.1.3](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.3)
@@ -57,7 +57,22 @@ curl http://localhost:3000/healthz
 根本不会被解析，因此 Range 本身语法错误也仍然得到 200。
 
 另有等价的 `GET /plan?size=...&contentType=...&etag=...&lastModified=...`，
-便于直接用浏览器/curl 探测。
+便于直接用浏览器/curl 探测。服务默认监听本机 **3000 端口**，即
+`http://localhost:3000`（可用 `PORT` 环境变量或 compose 端口映射修改）。
+
+`If-Range` / `lastModified` 的日期统一按 RFC 9110 §5.6.7 的 **HTTP-date**
+严格解析，三种标准格式都接受：
+
+| 格式 | 示例 | 说明 |
+| --- | --- | --- |
+| IMF-fixdate | `Wed, 21 Oct 2015 07:28:00 GMT` | 现代格式，4 位年份 |
+| RFC 850 | `Wednesday, 21-Oct-15 08:49:37 GMT` | 旧式格式，完整星期名、两位年份 |
+| asctime | `Wed Oct 21 07:28:00 2015` | 旧式格式，单位数日期前补空格，如 `Sun Nov  6 08:49:37 1994` |
+
+RFC 850 的两位年份按**接收时的 UTC 年份**解释：落在当前世纪对应位置，若
+结果在未来超过 50 年则回拨 100 年（例如 2026 年收到 `94` → 1994，
+`26` → 2026）。三种格式都会校验星期与真实日历是否一致、日历日期与时间
+字段是否合法；比较时统一使用解析后的时刻，所以混用格式也能正确判定。
 
 快速验证：
 
@@ -90,6 +105,24 @@ curl -X POST http://localhost:3000/plan \
 
 # 等价 GET
 curl 'http://localhost:3000/plan?size=10000' -H 'Range: bytes=-500'
+
+# If-Range 使用旧式 RFC 850 日期（两位年份）-> 与 Last-Modified 同一时刻，仍返回 206
+curl -X POST http://localhost:3000/plan \
+  -H 'Content-Type: application/json' \
+  -H 'Range: bytes=0-99' \
+  -H 'If-Range: Wednesday, 21-Oct-15 07:28:00 GMT' \
+  -d '{"size":10000,"lastModified":"Wed, 21 Oct 2015 07:28:00 GMT"}'
+
+# If-Range 使用 asctime 日期（单位数日期前补一个空格）-> 同样 206
+curl -X POST http://localhost:3000/plan \
+  -H 'Content-Type: application/json' \
+  -H 'Range: bytes=0-99' \
+  -H 'If-Range: Sun Nov  6 08:49:37 1994' \
+  -d '{"size":10000,"lastModified":"Sun, 06 Nov 1994 08:49:37 GMT"}'
+
+# 旧式日期同样可作为资源元数据（GET 版，注意空格需要 %20 编码）
+curl 'http://localhost:3000/plan?size=10000&lastModified=Wednesday,%2021-Oct-15%2007:28:00%20GMT' \
+  -H 'Range: bytes=0-99'
 ```
 
 ## 响应语义
@@ -138,9 +171,11 @@ curl 'http://localhost:3000/plan?size=10000' -H 'Range: bytes=-500'
   同一边界；不同规划必然不同。
 - **If-Range（§13.1.3）**：头值以 `"` 开头时按实体标签处理——必须是强标签
   且与当前 `etag` **逐字相等**（不做空白折叠/大小写归一；`W/…` 永不通过）；
-  否则按 HTTP-date 解析（仅接受 IMF-fixdate，并校验星期与真实日历一致），
-  日期 **不早于** `lastModified` 才通过。任何不通过的情形都降级为
-  `200 decision:"full"`；未提供 `If-Range` 时行为与原先完全一致。
+  否则按 HTTP-date 解析，接受 IMF-fixdate、RFC 850、asctime 三种标准格式，
+  校验星期与真实日历一致、日历日期与时间字段合法（RFC 850 两位年份按
+  接收时 UTC 年份解释，超过未来 50 年回拨 100 年），并把双方统一解析成
+  时刻后比较：日期 **不早于** `lastModified` 才通过。任何不通过的情形都
+  降级为 `200 decision:"full"`；未提供 `If-Range` 时行为与原先完全一致。
 
 单区间 206 响应示例（节选）：
 
@@ -207,13 +242,13 @@ PORT=8080 docker compose up --build -d   # 或编辑 compose 中的 ports 映射
 
 ```
 src/
-  conditional.js # If-Range 评估：强 ETag 逐字比较、严格 IMF-fixdate 解析
+  conditional.js # If-Range 评估：强 ETag 逐字比较、严格 HTTP-date 解析（IMF-fixdate/RFC 850/asctime）
   planner.js     # 范围规划核心：解析、夹取、丢弃、合并、边界生成、422 守卫、条件降级
   app.js         # Fastify 应用：POST/GET /plan、/healthz、输入校验
   server.js      # 启动入口与环境变量读取
 test/
   planner.test.js  # 原有 node:test 用例（26 个）
-  if-range.test.js # If-Range ETag/日期/降级/元数据校验用例（25 个）
+  if-range.test.js # If-Range ETag/日期（含旧式日期格式）/降级/元数据校验用例（34 个）
   headers.test.js  # 真实 socket 上的重复头与 CR/LF 拒绝用例（4 个）
 ```
 
@@ -221,7 +256,7 @@ test/
 
 ```bash
 npm ci
-npm test          # 55 个用例：区间解析/合并/416/422/边界 + If-Range ETag/日期/降级 + 重复头/CRLF
+npm test          # 64 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF
 npm start
 ```
 
@@ -232,8 +267,9 @@ npm start
 - `If-Range` 同样拒绝重复头（`400 DUPLICATE_IF_RANGE_HEADER`）；含 CR/LF
   的值在 HTTP 解析层即被拒绝（应用层另有一道 CR/LF 检查兜底）。
 - 资源元数据 `etag` 必须是合法 entity-tag、`lastModified` 必须是合法
-  IMF-fixdate 且不含 CR/LF，否则 `400 INVALID_ETAG` /
-  `400 INVALID_LAST_MODIFIED`；GET 的重复同名参数也会被拒绝。
+  HTTP-date（IMF-fixdate / RFC 850 / asctime 三种标准格式之一，且星期、
+  日历日期与时间字段均合法）且不含 CR/LF，否则
+  `400 INVALID_ETAG` / `400 INVALID_LAST_MODIFIED`；GET 的重复同名参数也会被拒绝。
 - `If-Range` 中的非法验证器**不**算请求错误：按 RFC 忽略 Range 并返回
   200 完整规划（`condition.reason: "invalid-validator"`）。
 - `contentType` 需为合法媒体类型且不含 CR/LF，杜绝响应头注入。
